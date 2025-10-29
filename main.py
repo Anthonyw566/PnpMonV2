@@ -822,12 +822,24 @@ class SimplePNPMon(ctk.CTk):
         self.file_base_time = None  # Base timestamp from file (for absolute time mode)
         self.units_per_sec = 1000000.0  # Conversion factor for time units to seconds (divide by 1000000.0)
         self.time_mode = tk.StringVar(value="elapsed")  # Time display mode: "elapsed" or "absolute"
+        self.is_live_data = False  # Track if data is from live monitoring (True) or file (False)
 
         # Plot data storage (for refreshing when time mode changes)
         self.plot_times = []  # Time values for current plot (in seconds)
         self.plot_values = []  # Y-axis values for current plot
         self.plot_byte_indices = []  # Which byte indices are being plotted
         self.plot_datetimes = []  # Datetime objects for tooltips (with DST applied)
+        self.plot_filter_src_id = None  # Source node ID for plot filtering
+        self.plot_filter_src_ch = None  # Source channel for plot filtering
+        self.plot_filter_dst_id = None  # Destination node ID for plot filtering
+        self.plot_filter_dst_ch = None  # Destination channel for plot filtering
+        self.live_plot_timer_id = None  # Timer ID for live plot updates
+        self.live_plot_update_interval = 100  # Update plot every 100ms (0.1 seconds)
+
+        # Pause tracking for red line visualization
+        self.pause_ranges = []  # List of (start_packet_idx, end_packet_idx) tuples for pause periods
+        self.pause_start_idx = None  # Packet index when pause was pressed
+        self.waiting_for_resume_packet = False  # Flag to capture first packet after resume
 
         # Node mapping (friendly names for node IDs)
         self.node_map = {
@@ -848,6 +860,8 @@ class SimplePNPMon(ctk.CTk):
         self.monitor: Optional[ISSwitchMonitor] = None
         self.is_connected = False
         self.live_base_time = None  # Base timestamp for live monitoring (first packet time)
+        self.auto_scroll_enabled = True  # Auto-scroll to newest packets in live mode
+        self.is_paused = False  # Pause state for monitoring
 
         # Network interface selection
         self.available_interfaces = get_network_interfaces()  # Dict: {ip: interface_name}
@@ -980,7 +994,36 @@ class SimplePNPMon(ctk.CTk):
             hover_color=("#dd7777", "#aa5555"),
             state="disabled"
         )
-        self.disconnect_btn.pack(side=tk.LEFT)
+        self.disconnect_btn.pack(side=tk.LEFT, padx=(0, 12))
+
+        # Auto-scroll toggle button
+        self.autoscroll_btn = ctk.CTkButton(
+            conn_frame,
+            text="📜 Auto-Scroll: ON",
+            command=self._toggle_autoscroll,
+            width=140,
+            height=32,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            corner_radius=6,
+            fg_color=("#2b7cc7", "#1a5a9e"),
+            hover_color=("#3a7ebf", "#1f538d")
+        )
+        self.autoscroll_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        # Pause/Resume button for monitoring
+        self.pause_btn = ctk.CTkButton(
+            conn_frame,
+            text="⏸ Pause",
+            command=self._toggle_pause,
+            width=100,
+            height=32,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            corner_radius=6,
+            fg_color=("#cc8800", "#aa6600"),
+            hover_color=("#dd9900", "#bb7700"),
+            state="disabled"
+        )
+        self.pause_btn.pack(side=tk.LEFT)
 
         # ====================================================================
         # FILE LOADING AREA (integrated below connection)
@@ -1205,8 +1248,11 @@ class SimplePNPMon(ctk.CTk):
             plot_card = tk.Frame(plot_frame, bg="#141414", highlightthickness=0)
             plot_card.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
 
-            self.plot_fig = Figure(figsize=(10, 3.5), tight_layout=True, facecolor='#141414')
+            # Increase height and add padding for tooltips at top
+            self.plot_fig = Figure(figsize=(10, 5.0), facecolor='#141414')
             self.plot_ax = self.plot_fig.add_subplot(111)
+            # Add extra top padding to prevent tooltip from squishing plot
+            self.plot_fig.subplots_adjust(top=0.85, bottom=0.15, left=0.10, right=0.95)
             self.plot_ax.set_facecolor('#141414')
             self.plot_ax.set_xlabel("Time (seconds)", fontsize=10, color="#999999")
             self.plot_ax.set_ylabel("Value", fontsize=10, color="#999999")
@@ -1256,6 +1302,12 @@ class SimplePNPMon(ctk.CTk):
             self._set_status(f"Loading {path}...")
             self.packets = list(parse_pmcp(path))
             self.file_path = path
+            self.is_live_data = False  # File data (DST adjustment will be applied)
+
+            # Clear pause ranges (only relevant for live data)
+            self.pause_ranges = []
+            self.pause_start_idx = None
+            self.waiting_for_resume_packet = False
 
             # Extract base time from first packet (for absolute time mode)
             if self.packets and self.packets[0].get("time_base"):
@@ -1434,12 +1486,13 @@ class SimplePNPMon(ctk.CTk):
     def _offs_to_datetime(self, offs_units: Optional[int]) -> Optional[datetime]:
         """
         Convert offset units to absolute datetime with NSW DST adjustment.
+        DST adjustment is ONLY applied to file data, not live monitoring data.
 
         Args:
             offs_units: Time offset in arbitrary units
 
         Returns:
-            Absolute datetime (with DST applied if applicable), or None if base_time not available
+            Absolute datetime (with DST applied for file data only), or None if base_time not available
         """
         if self.file_base_time is None or offs_units is None:
             return None
@@ -1448,8 +1501,10 @@ class SimplePNPMon(ctk.CTk):
         if seconds is None:
             return None
         dt = self.file_base_time + timedelta(seconds=seconds)
-        # Apply DST adjustment for NSW Australia
-        return self._apply_dst_adjustment(dt)
+        # Apply DST adjustment ONLY for file data (live monitoring already has correct time)
+        if not self.is_live_data:
+            return self._apply_dst_adjustment(dt)
+        return dt
 
     def _fmt_time_abs(self, dt: Optional[datetime]) -> str:
         """
@@ -1513,10 +1568,18 @@ class SimplePNPMon(ctk.CTk):
         """
         Called when user clicks a row in the packet table.
         Displays the hex payload of the selected packet in compact 8+8 format.
+        Also disables auto-scroll so user can browse packets.
         """
         selection = self.tree.selection()
         if not selection:
             return
+
+        # Disable auto-scroll when user manually selects a packet
+        if self.is_connected:
+            if self.auto_scroll_enabled:
+                self.auto_scroll_enabled = False
+            # Always update button to ensure UI stays in sync
+            self._update_autoscroll_button()
 
         # Get packet index from selection
         try:
@@ -1586,10 +1649,30 @@ class SimplePNPMon(ctk.CTk):
                 x_values = self.plot_times
                 x_label = "Time (seconds)"
 
-        # Plot the data
+        # Draw all points in blue first
         line, = self.plot_ax.plot(x_values, self.plot_values, marker='o', linestyle='-',
                                   linewidth=1.8, markersize=4,
-                                  color='#3a7ebf', markerfacecolor='#5da3e8', markeredgecolor='#5da3e8')
+                                  color='#3a7ebf', markerfacecolor='#5da3e8', markeredgecolor='#5da3e8',
+                                  zorder=1)
+
+        # Draw red line segments for pause gaps
+        # Each pause range is (start_idx, end_idx) where:
+        # - start_idx = last packet before pause
+        # - end_idx = first packet after resume
+        # We only draw the line segment connecting these two points in red
+        for start_idx, end_idx in self.pause_ranges:
+            if start_idx < len(self.plot_values) and end_idx < len(self.plot_values):
+                # Draw red line from last point before pause to first point after resume
+                self.plot_ax.plot([x_values[start_idx], x_values[end_idx]],
+                                 [self.plot_values[start_idx], self.plot_values[end_idx]],
+                                 color='#ff4444', linewidth=2.5, linestyle='-', zorder=2)
+                # Draw red markers on these two points
+                self.plot_ax.plot(x_values[start_idx], self.plot_values[start_idx], marker='o',
+                                 markersize=5, color='#ff4444', markerfacecolor='#ff6666',
+                                 markeredgecolor='#ff6666', zorder=3)
+                self.plot_ax.plot(x_values[end_idx], self.plot_values[end_idx], marker='o',
+                                 markersize=5, color='#ff4444', markerfacecolor='#ff6666',
+                                 markeredgecolor='#ff6666', zorder=3)
 
         # Set labels and styling
         self.plot_ax.set_xlabel(x_label, fontsize=10, color="#999999")
@@ -1615,6 +1698,10 @@ class SimplePNPMon(ctk.CTk):
             spine.set_edgecolor('#2a2a2a')
             spine.set_linewidth(0.5)
 
+        # CRITICAL: Lock plot limits to prevent tooltip from moving points
+        self.plot_ax.set_xlim(self.plot_ax.get_xlim())
+        self.plot_ax.set_ylim(self.plot_ax.get_ylim())
+
         # Create tooltip annotation (initially invisible)
         annot = self.plot_ax.annotate(
             "",
@@ -1626,7 +1713,8 @@ class SimplePNPMon(ctk.CTk):
             fontsize=9,
             color="#ffffff",
             visible=False,
-            zorder=100
+            zorder=100,
+            clip_on=False  # Prevent annotation from affecting plot bounds
         )
 
         # Event handler for mouse hover
@@ -1716,17 +1804,50 @@ class SimplePNPMon(ctk.CTk):
             messagebox.showinfo("Invalid Selection", "Please select complete hex bytes (e.g., 'A3 FF')")
             return
 
-        # Extract values from all packets
+        # Get the currently selected packet's routing info to filter by exact src:ch -> dest:ch
+        if self.selected_packet_idx is None or self.selected_packet_idx >= len(self.packets):
+            self._set_status("❌ Error: Please select a packet from the table first")
+            messagebox.showinfo("No Packet Selected", "Please click a packet in the table first to see its hex bytes, then select (click and drag) the hex bytes you want to plot.")
+            return
+
+        selected_packet = self.packets[self.selected_packet_idx]
+        filter_src_id = selected_packet["src_id"]
+        filter_src_ch = selected_packet["src_ch"]
+        filter_dst_id = selected_packet["dst_id"]
+        filter_dst_ch = selected_packet["dst_ch"]
+
+        # Store filter values for live plot updates
+        self.plot_filter_src_id = filter_src_id
+        self.plot_filter_src_ch = filter_src_ch
+        self.plot_filter_dst_id = filter_dst_id
+        self.plot_filter_dst_ch = filter_dst_ch
+
+        # Show what we're filtering for
+        src_str = self._format_node(filter_src_id, filter_src_ch)
+        dest_str = self._format_node(filter_dst_id, filter_dst_ch)
+        self._set_status(f"🔍 Filtering packets from {src_str} → {dest_str} at byte positions {byte_indices}...")
+
+        # Extract values from packets with EXACT same source:channel -> dest:channel
         times = []
         values = []
         datetimes = []
+        matched_count = 0  # Track how many packets match the routing filter
 
         for packet in self.packets:
+            # Only plot packets with exact same routing (src_id:src_ch -> dst_id:dst_ch)
+            if (packet["src_id"] != filter_src_id or
+                packet["src_ch"] != filter_src_ch or
+                packet["dst_id"] != filter_dst_id or
+                packet["dst_ch"] != filter_dst_ch):
+                continue  # Skip packets with different routing
+
+            matched_count += 1  # This packet matches the routing filter
+
             time_sec = self._offs_to_seconds(packet["offs_units"])
             if time_sec is None:
                 continue
 
-            # Extract bytes at selected indices
+            # Extract bytes at selected indices (same positions across all matching packets)
             payload = packet["payload"]
             try:
                 selected_bytes = [payload[i] for i in byte_indices if i < len(payload)]
@@ -1746,7 +1867,18 @@ class SimplePNPMon(ctk.CTk):
                 continue
 
         if not times:
-            messagebox.showinfo("No Data", "No valid data found for selected bytes")
+            # Show detailed error message
+            if matched_count == 0:
+                self._set_status(f"❌ No packets found with routing {src_str} → {dest_str}")
+                messagebox.showinfo("No Matching Packets",
+                    f"No packets found with exact routing:\n{src_str} → {dest_str}\n\n"
+                    f"Total packets: {len(self.packets)}")
+            else:
+                self._set_status(f"❌ Found {matched_count} packets with matching routing, but none had valid data at byte positions {byte_indices}")
+                messagebox.showinfo("No Valid Data",
+                    f"Found {matched_count} packets with routing {src_str} → {dest_str}\n"
+                    f"but none had valid data at byte positions {byte_indices}.\n\n"
+                    f"The payload might be too short in those packets.")
             return
 
         # Store plot data for refreshing when time mode changes
@@ -1758,14 +1890,21 @@ class SimplePNPMon(ctk.CTk):
         # Draw the plot using the helper method
         self._draw_plot()
 
-        # Update status
+        # Start live plot updates if monitoring live data
+        if self.is_connected and self.is_live_data:
+            self._start_live_plot_updates()
+
+        # Update status with routing filter info
         byte_range = f"bytes [{byte_indices[0]}"
         if len(byte_indices) > 1:
             byte_range += f"-{byte_indices[-1]}"
         byte_range += "]"
 
+        src_str = self._format_node(filter_src_id, filter_src_ch)
+        dest_str = self._format_node(filter_dst_id, filter_dst_ch)
+
         self._set_status(
-            f"Plotted {len(times)} points for {byte_range} "
+            f"Plotted {len(times)} points for {byte_range} from {src_str} → {dest_str} "
             f"(range: {min(values)} to {max(values)})"
         )
 
@@ -1821,6 +1960,88 @@ class SimplePNPMon(ctk.CTk):
         return byte_indices
 
     # ========================================================================
+    # LIVE PLOT UPDATES
+    # ========================================================================
+
+    def _start_live_plot_updates(self):
+        """Start periodic plot updates for live monitoring."""
+        # Cancel existing timer if any
+        self._stop_live_plot_updates()
+
+        # Schedule first update
+        self.live_plot_timer_id = self.after(self.live_plot_update_interval, self._update_live_plot)
+
+    def _stop_live_plot_updates(self):
+        """Stop periodic plot updates."""
+        if self.live_plot_timer_id is not None:
+            self.after_cancel(self.live_plot_timer_id)
+            self.live_plot_timer_id = None
+
+    def _update_live_plot(self):
+        """
+        Update plot with latest data during live monitoring.
+        Called periodically by timer.
+        """
+        # Only continue if still monitoring, not paused, and have byte indices selected
+        if not self.is_connected or not self.is_live_data or not self.plot_byte_indices or self.is_paused:
+            self._stop_live_plot_updates()
+            return
+
+        # Re-extract values from all packets (including new ones)
+        # Filter by exact routing if filter is set
+        times = []
+        values = []
+        datetimes = []
+
+        for packet in self.packets:
+            # Apply routing filter if set (only plot exact src:ch -> dst:ch match)
+            if (self.plot_filter_src_id is not None and
+                (packet["src_id"] != self.plot_filter_src_id or
+                 packet["src_ch"] != self.plot_filter_src_ch or
+                 packet["dst_id"] != self.plot_filter_dst_id or
+                 packet["dst_ch"] != self.plot_filter_dst_ch)):
+                continue  # Skip packets with different routing
+
+            time_sec = self._offs_to_seconds(packet["offs_units"])
+            if time_sec is None:
+                continue
+
+            # Extract bytes at selected indices
+            payload = packet["payload"]
+            try:
+                selected_bytes = [payload[i] for i in self.plot_byte_indices if i < len(payload)]
+                if len(selected_bytes) != len(self.plot_byte_indices):
+                    continue  # Skip if payload too short
+
+                # Convert to integer (little-endian)
+                value = int.from_bytes(bytes(selected_bytes), byteorder='little')
+
+                # Convert to datetime with DST applied (for tooltips)
+                dt = self._offs_to_datetime(packet["offs_units"])
+
+                times.append(time_sec)
+                values.append(value)
+                datetimes.append(dt)
+            except (IndexError, ValueError):
+                continue
+
+        if not times:
+            # No data, but keep trying
+            self.live_plot_timer_id = self.after(self.live_plot_update_interval, self._update_live_plot)
+            return
+
+        # Update stored plot data
+        self.plot_times = times
+        self.plot_values = values
+        self.plot_datetimes = datetimes
+
+        # Redraw plot
+        self._draw_plot()
+
+        # Schedule next update
+        self.live_plot_timer_id = self.after(self.live_plot_update_interval, self._update_live_plot)
+
+    # ========================================================================
     # TIME MODE TOGGLE
     # ========================================================================
 
@@ -1852,6 +2073,68 @@ class SimplePNPMon(ctk.CTk):
             self._draw_plot()
 
     # ========================================================================
+    # AUTO-SCROLL TOGGLE
+    # ========================================================================
+
+    def _toggle_autoscroll(self):
+        """Toggle auto-scroll on/off."""
+        self.auto_scroll_enabled = not self.auto_scroll_enabled
+        self._update_autoscroll_button()
+
+    def _update_autoscroll_button(self):
+        """Update auto-scroll button text and color based on state."""
+        if self.auto_scroll_enabled:
+            self.autoscroll_btn.configure(
+                text="📜 Auto-Scroll: ON",
+                fg_color=("#2b7cc7", "#1a5a9e"),
+                hover_color=("#3a7ebf", "#1f538d")
+            )
+        else:
+            self.autoscroll_btn.configure(
+                text="📜 Auto-Scroll: OFF",
+                fg_color=("#666666", "#444444"),
+                hover_color=("#777777", "#555555")
+            )
+
+    # ========================================================================
+    # PAUSE/RESUME TOGGLE
+    # ========================================================================
+
+    def _toggle_pause(self):
+        """Toggle pause/resume for live monitoring."""
+        self.is_paused = not self.is_paused
+        self._update_pause_button()
+
+        if self.is_paused:
+            self._set_status("⏸ Monitoring paused")
+            # Track pause start: last packet before pause
+            self.pause_start_idx = len(self.packets) - 1 if self.packets else None
+            # Stop live plot updates
+            self._stop_live_plot_updates()
+        else:
+            self._set_status("▶ Monitoring resumed")
+            # Wait for first packet after resume to complete the pause range
+            self.waiting_for_resume_packet = True
+            # Restart live plot updates if we have byte indices selected
+            if self.is_connected and self.is_live_data and self.plot_byte_indices:
+                self._start_live_plot_updates()
+
+    def _update_pause_button(self):
+        """Update pause button text and color based on state."""
+        if self.is_paused:
+            self.pause_btn.configure(
+                text="▶ Resume",
+                fg_color=("#66cc66", "#55aa55"),
+                hover_color=("#77dd77", "#66bb66")
+            )
+        else:
+            self.pause_btn.configure(
+                text="⏸ Pause",
+                fg_color=("#cc8800", "#aa6600"),
+                hover_color=("#dd9900", "#bb7700")
+            )
+
+    # ========================================================================
     # INTERFACE SELECTION
     # ========================================================================
 
@@ -1879,7 +2162,7 @@ class SimplePNPMon(ctk.CTk):
     def on_packet_received(self, packet: Dict[str, Any]):
         """
         Called when a packet is received from the live switch connection.
-        Updates UI in real-time.
+        Updates UI in real-time (unless paused).
 
         Handles time tracking for live packets:
         - First packet: Sets live_base_time and file_base_time
@@ -1888,6 +2171,11 @@ class SimplePNPMon(ctk.CTk):
         Args:
             packet: Packet dictionary from ISSwitchMonitor
         """
+        # Skip packet processing if paused
+        if self.is_paused:
+            return
+
+        # Store packet first
         # Track first packet timestamp as base time
         if self.live_base_time is None and packet["offs_units"] is not None:
             # First packet - set base time
@@ -1906,6 +2194,14 @@ class SimplePNPMon(ctk.CTk):
 
         # Store packet
         self.packets.append(packet)
+
+        # Check if this is the first packet after resume (for red line visualization)
+        if self.waiting_for_resume_packet and self.pause_start_idx is not None:
+            # This is the first packet after resume
+            pause_end_idx = len(self.packets) - 1
+            self.pause_ranges.append((self.pause_start_idx, pause_end_idx))
+            self.pause_start_idx = None
+            self.waiting_for_resume_packet = False
 
         # Update UI (must be done in main thread)
         self.after(0, self._add_packet_to_table, len(self.packets) - 1)
@@ -1942,16 +2238,44 @@ class SimplePNPMon(ctk.CTk):
         # Size - use payload length (matches file loading behavior)
         size = len(packet["payload"])
 
-        # Insert at top (newest first) with proper iid for row selection
-        # Use iid=str(packet_idx) so _on_packet_selected() can retrieve packet
-        self.tree.insert("", 0, iid=str(packet_idx), values=(time_str, src, dst, size))
+        # CRITICAL: Preserve scroll position when auto-scroll is disabled
+        # When inserting at position 0, we need to compensate for the new item added above
+        if not self.auto_scroll_enabled:
+            try:
+                # Save current scroll position (fraction of total height)
+                saved_yview = self.tree.yview()
 
-        # Auto-scroll to top
-        children = self.tree.get_children()
-        if children:
-            self.tree.see(children[0])
+                # Get current number of items before insertion
+                num_items_before = len(self.tree.get_children())
+
+                # Insert at top (newest first) with proper iid for row selection
+                self.tree.insert("", 0, iid=str(packet_idx), values=(time_str, src, dst, size))
+
+                # Get new number of items after insertion
+                num_items_after = len(self.tree.get_children())
+
+                # Calculate adjustment needed to stay at the same absolute position
+                # Since we added 1 item at the top, scroll down by 1 item to compensate
+                if num_items_before > 0 and num_items_after > num_items_before:
+                    # Scroll down by 1 unit (1 item) to compensate for the new item added above
+                    self.tree.yview_scroll(1, "units")
+
+            except Exception as e:
+                # If adjustment fails, just insert normally
+                self.tree.insert("", 0, iid=str(packet_idx), values=(time_str, src, dst, size))
+        else:
+            # Auto-scroll is enabled - just insert normally
+            # Insert at top (newest first) with proper iid for row selection
+            self.tree.insert("", 0, iid=str(packet_idx), values=(time_str, src, dst, size))
+
+        # Auto-scroll to top (only if auto-scroll is enabled)
+        if self.auto_scroll_enabled:
+            children = self.tree.get_children()
+            if children:
+                self.tree.see(children[0])
 
         # Limit table size (keep last 1000 packets)
+        children = self.tree.get_children()
         if len(children) > 1000:
             # Remove oldest row
             self.tree.delete(children[-1])
@@ -1992,12 +2316,20 @@ class SimplePNPMon(ctk.CTk):
             self.interface_dropdown.configure(state="disabled")
             self.ip_entry.configure(state="disabled")
             self.port_entry.configure(state="disabled")
+            self.pause_btn.configure(state="normal")  # Enable pause button
 
             # Clear existing packets and reset time tracking when connecting live
             self.packets.clear()
             self.tree.delete(*self.tree.get_children())
             self.live_base_time = None  # Reset live time tracking
             self.file_base_time = None  # Will be set by first packet
+            self.is_live_data = True  # Live monitoring (NO DST adjustment)
+            self.auto_scroll_enabled = True  # Enable auto-scroll for live monitoring
+            self.is_paused = False  # Reset pause state
+            self.pause_ranges = []  # Clear pause tracking
+            self.pause_start_idx = None
+            self._update_autoscroll_button()
+            self._update_pause_button()
         else:
             self._set_status("❌ Connection failed - Check IP/port and try again")
             self.connect_btn.configure(state="normal")
@@ -2017,6 +2349,9 @@ class SimplePNPMon(ctk.CTk):
         self._set_status("Disconnecting...")
         self.update()
 
+        # Stop live plot updates
+        self._stop_live_plot_updates()
+
         # Disconnect
         self.monitor.disconnect()
 
@@ -2028,9 +2363,14 @@ class SimplePNPMon(ctk.CTk):
         self.interface_dropdown.configure(state="readonly")
         self.ip_entry.configure(state="normal")
         self.port_entry.configure(state="normal")
+        self.pause_btn.configure(state="disabled")  # Disable pause button
 
-        # Reset live time tracking
+        # Reset live time tracking and pause state
         self.live_base_time = None
+        self.is_paused = False
+        self.pause_ranges = []
+        self.pause_start_idx = None
+        self._update_pause_button()
 
     def on_closing(self):
         """Handle window close event."""
